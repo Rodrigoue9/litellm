@@ -14,6 +14,8 @@ from litellm.llms.custom_httpx.http_handler import (
     _get_httpx_client,
     get_async_httpx_client,
 )
+from litellm.rust_bridge import chat_completions as rust_chat_completions_bridge
+from litellm.rust_bridge.chat_completions import rust_chat_completions_accepts
 from litellm.types.utils import ModelResponse
 from litellm.utils import CustomStreamWrapper
 
@@ -169,6 +171,7 @@ class BedrockConverseLLM(BaseAWSLLM):
         headers: dict = {},
         client: AsyncHTTPHandler | None = None,
         api_key: str | None = None,
+        skip_pre_call_logging: bool = False,
     ) -> ModelResponse | CustomStreamWrapper:
         request_data: Final = await litellm.AmazonConverseConfig()._async_transform_request(
             model=model,
@@ -190,15 +193,19 @@ class BedrockConverseLLM(BaseAWSLLM):
         )
 
         ## LOGGING
-        logging_obj.pre_call(
-            input=messages,
-            api_key="",
-            additional_args={
-                "complete_input_dict": data,
-                "api_base": api_base,
-                "headers": prepped.headers,
-            },
-        )
+        # The Rust path already logged this request's pre_call before handing
+        # it here, and it only declines before the provider is called, so this
+        # is the same attempt continuing rather than a second one.
+        if not skip_pre_call_logging:
+            logging_obj.pre_call(
+                input=messages,
+                api_key="",
+                additional_args={
+                    "complete_input_dict": data,
+                    "api_base": api_base,
+                    "headers": prepped.headers,
+                },
+            )
 
         headers = dict(prepped.headers)
         if client is None or not isinstance(client, AsyncHTTPHandler):
@@ -354,6 +361,78 @@ class BedrockConverseLLM(BaseAWSLLM):
 
         # Filter beta headers in HTTP headers before making the request
         headers = update_headers_with_filtered_beta(headers=headers, provider="bedrock_converse")
+
+        # The Rust core owns the whole call for the subset it accepts. Ask
+        # before transforming so whichever path runs emits pre_call once, and
+        # hand down the credentials, region and endpoint this handler already
+        # resolved so both paths sign as the same principal.
+        rust_optional_params: Final = {
+            **optional_params,
+            **{
+                key: value
+                for key, value in (
+                    ("aws_access_key_id", credentials.access_key),
+                    ("aws_secret_access_key", credentials.secret_key),
+                    ("aws_session_token", credentials.token),
+                    ("aws_region_name", aws_region_name),
+                )
+                if value is not None
+            },
+        }
+        if rust_chat_completions_accepts(
+            model=model,
+            messages=messages,
+            optional_params=rust_optional_params,
+            custom_llm_provider="bedrock",
+            litellm_params=litellm_params,
+            stream=stream,
+        ):
+            logging_obj.pre_call(
+                input=messages,
+                api_key="",
+                additional_args={
+                    "complete_input_dict": {"messages": messages, **optional_params},
+                    "api_base": proxy_endpoint_url,
+                    "headers": headers,
+                },
+            )
+            rust_kwargs: Final = {
+                "model": model,
+                "messages": messages,
+                "optional_params": rust_optional_params,
+                "model_response": model_response,
+                "api_key": api_key,
+                "api_base": proxy_endpoint_url,
+                "custom_llm_provider": "bedrock",
+                "extra_headers": headers,
+                "timeout": timeout,
+            }
+            if acompletion:
+                return rust_chat_completions_bridge.achat_completions_or_fallback(
+                    **rust_kwargs,
+                    python_fallback=lambda: self.async_completion(
+                        model=model,
+                        messages=messages,
+                        api_base=proxy_endpoint_url,
+                        model_response=model_response,
+                        encoding=encoding,
+                        logging_obj=logging_obj,
+                        optional_params=optional_params,
+                        stream=stream,
+                        litellm_params=litellm_params,
+                        logger_fn=logger_fn,
+                        headers=headers,
+                        timeout=timeout,
+                        client=client,
+                        credentials=credentials,
+                        api_key=api_key,
+                        skip_pre_call_logging=True,
+                    ),
+                )
+            rust_response: Final = rust_chat_completions_bridge.chat_completions(**rust_kwargs)
+            if rust_response is not None:
+                return rust_response
+
         ### ROUTING (ASYNC, STREAMING, SYNC)
         if acompletion:
             if isinstance(client, HTTPHandler):

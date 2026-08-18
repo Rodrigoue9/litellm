@@ -24,6 +24,8 @@ from litellm.llms.custom_httpx.http_handler import (
     _get_httpx_client,
     get_async_httpx_client,
 )
+from litellm.rust_bridge import chat_completions as rust_chat_completions_bridge
+from litellm.rust_bridge.chat_completions import rust_chat_completions_accepts
 from litellm.types.llms.anthropic import (
     ContentBlockDelta,
     ContentBlockStart,
@@ -361,30 +363,123 @@ class AnthropicChatCompletion(BaseLLM):
         if config is None:
             raise ValueError(f"Provider config not found for model: {model} and provider: {custom_llm_provider}")
 
-        data = config.transform_request(
+        def build_request() -> tuple[dict, dict]:  # mutable-ok: rewritten in place downstream
+            """Translate the request the Python way, returning `(headers, data)`.
+
+            The pair stays mutable because the streaming path rewrites it in
+            place (`data["stream"] = True`) before sending.
+
+            Shared by the normal path and by the Rust path's fallback, which
+            builds it only when the Rust call did not serve the request.
+            """
+            request_data: Final = config.transform_request(
+                model=model,
+                messages=messages,
+                optional_params={**optional_params, "is_vertex_request": is_vertex_request},
+                litellm_params=litellm_params,
+                headers=headers,
+            )
+            return update_request_with_filtered_beta(
+                headers=headers,
+                request_data=request_data,
+                provider=custom_llm_provider,
+            )
+
+        # The Rust core owns the whole call for the subset it accepts, so ask
+        # before transforming: whichever path runs emits pre_call exactly once.
+        # `get_config` merges the class-level defaults (Anthropic's required
+        # `max_tokens` among them) that `transform_request` would have applied.
+        rust_optional_params: Final = {
+            **AnthropicConfig.get_config(model=model),
+            **optional_params,
+        }
+        serves_via_rust: Final = rust_chat_completions_accepts(
             model=model,
             messages=messages,
-            optional_params={**optional_params, "is_vertex_request": is_vertex_request},
+            optional_params=rust_optional_params,
+            custom_llm_provider=custom_llm_provider,
             litellm_params=litellm_params,
-            headers=headers,
+            stream=stream,
         )
+        if serves_via_rust:
+            logging_obj.pre_call(
+                input=messages,
+                api_key=api_key,
+                additional_args={
+                    "complete_input_dict": {
+                        "model": model,
+                        "messages": messages,
+                        **rust_optional_params,
+                    },
+                    "api_base": api_base,
+                    "headers": headers,
+                },
+            )
+            rust_kwargs: Final = {
+                "model": model,
+                "messages": messages,
+                "optional_params": rust_optional_params,
+                "model_response": model_response,
+                "api_key": api_key,
+                "api_base": api_base,
+                "custom_llm_provider": custom_llm_provider,
+                "extra_headers": headers,
+                "timeout": timeout,
+            }
+            if acompletion is True:
 
-        headers, data = update_request_with_filtered_beta(
-            headers=headers,
-            request_data=data,
-            provider=custom_llm_provider,
-        )
+                async def python_fallback() -> "ModelResponse | CustomStreamWrapper":
+                    # pre_call already fired for this request above. The Rust
+                    # path only declines before the provider is called, so this
+                    # is the same attempt continuing, not a second one.
+                    fallback_headers, fallback_data = build_request()
+                    return await self.acompletion_function(
+                        model=model,
+                        messages=messages,
+                        data=fallback_data,
+                        api_base=api_base,
+                        custom_prompt_dict=custom_prompt_dict,
+                        model_response=model_response,
+                        print_verbose=print_verbose,
+                        encoding=encoding,
+                        api_key=api_key,
+                        provider_config=config,
+                        logging_obj=logging_obj,
+                        optional_params=optional_params,
+                        stream=stream,
+                        _is_function_call=_is_function_call,
+                        litellm_params=litellm_params,
+                        logger_fn=logger_fn,
+                        headers=fallback_headers,
+                        client=client,
+                        json_mode=json_mode,
+                        timeout=timeout,
+                    )
+
+                return rust_chat_completions_bridge.achat_completions_or_fallback(
+                    **rust_kwargs,
+                    python_fallback=python_fallback,
+                )
+            rust_response: Final = rust_chat_completions_bridge.chat_completions(**rust_kwargs)
+            if rust_response is not None:
+                return rust_response
+
+        headers, data = build_request()
 
         ## LOGGING
-        logging_obj.pre_call(
-            input=messages,
-            api_key=api_key,
-            additional_args={
-                "complete_input_dict": data,
-                "api_base": api_base,
-                "headers": headers,
-            },
-        )
+        # Reaching here with `serves_via_rust` set means the Rust attempt
+        # declined at call time, before the provider was called, and already
+        # logged this request. That is the same attempt continuing.
+        if not serves_via_rust:
+            logging_obj.pre_call(
+                input=messages,
+                api_key=api_key,
+                additional_args={
+                    "complete_input_dict": data,
+                    "api_base": api_base,
+                    "headers": headers,
+                },
+            )
         print_verbose(f"_is_function_call: {_is_function_call}")
         if acompletion is True:
             if (
