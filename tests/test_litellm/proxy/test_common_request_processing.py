@@ -569,6 +569,54 @@ class TestProxyBaseLLMRequestProcessing:
         assert headers["x-litellm-model-id"] == "meta-model-id"
 
     @pytest.mark.asyncio
+    async def test_build_litellm_proxy_success_headers_folds_pre_call_guardrail_cost(self):
+        """LIT-5651 regression: the alternate header builder used by native
+        :generateContent (and other routes bypassing base_process_llm_request)
+        emitted the LLM-only ``response_cost`` from ``_hidden_params`` and
+        ignored any Bedrock guardrail spend already merged into the request
+        metadata bucket. The resulting ``x-litellm-response-cost`` header
+        understated cost on every guarded success."""
+
+        class _FakeResponse:
+            _hidden_params = {"response_cost": 0.001}
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = {}
+        logging_obj = MagicMock()
+        logging_obj.litellm_call_id = "cid-guard"
+        mock_user = MagicMock()
+        mock_user.tpm_limit = None
+        mock_user.rpm_limit = None
+        mock_user.max_budget = None
+        mock_user.spend = 0.0
+        mock_user.allowed_model_region = None
+        proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        proxy_logging_obj.post_call_response_headers_hook = AsyncMock(return_value={})
+
+        headers = await ProxyBaseLLMRequestProcessing.build_litellm_proxy_success_headers_from_llm_response(
+            response=_FakeResponse(),
+            request_data={
+                "model": "gemini/gemini-2.5-flash",
+                "litellm_metadata": {
+                    "standard_logging_guardrail_information": [
+                        {
+                            "guardrail_name": "bedrock-guard",
+                            "guardrail_status": "success",
+                            "guardrail_cost": 0.0003,
+                        }
+                    ]
+                },
+            },
+            request=mock_request,
+            user_api_key_dict=mock_user,
+            logging_obj=logging_obj,
+            version="1.0.0",
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+        assert float(headers["x-litellm-response-cost"]) == pytest.approx(0.0013)
+
+    @pytest.mark.asyncio
     async def test_add_litellm_data_to_request_with_stream_timeout_header(self):
         """
         Test that x-litellm-stream-timeout header gets processed and added to request data
@@ -4841,6 +4889,54 @@ class TestResponseCostHeaderForTypedDictResponses:
         assert "_hidden_params" not in result
         assert fastapi_response.headers["x-ratelimit-limit-input-tokens"] == "25"
         assert fastapi_response.headers["x-litellm-response-cost"] == "0.00123"
+
+
+class TestFoldGuardrailCostIntoResponseCost:
+    """LIT-5651 regression: streaming and alternate-route header builders must
+    surface the pre-call Bedrock guardrail spend that non-streaming success
+    already folded into ``x-litellm-response-cost``. The shared helper is
+    exercised here so a regression is caught before it fans out to all four
+    call sites (build_litellm_proxy_success_headers_from_llm_response, the
+    streaming path, the non-streaming passthrough path, and the non-streaming
+    completion tail)."""
+
+    def test_returns_untouched_response_cost_when_no_guardrail_information(self):
+        assert ProxyBaseLLMRequestProcessing._fold_guardrail_cost_into_response_cost(0.001, {}) == 0.001
+
+    def test_returns_untouched_response_cost_when_guardrail_cost_is_zero(self):
+        request_data = {
+            "litellm_metadata": {
+                "standard_logging_guardrail_information": [
+                    {"guardrail_name": "g", "guardrail_status": "success", "guardrail_cost": 0.0}
+                ]
+            }
+        }
+        assert ProxyBaseLLMRequestProcessing._fold_guardrail_cost_into_response_cost(0.001, request_data) == 0.001
+
+    def test_adds_guardrail_cost_when_present(self):
+        request_data = {
+            "litellm_metadata": {
+                "standard_logging_guardrail_information": [
+                    {"guardrail_name": "g", "guardrail_status": "success", "guardrail_cost": 0.0003}
+                ]
+            }
+        }
+        merged = ProxyBaseLLMRequestProcessing._fold_guardrail_cost_into_response_cost(0.001, request_data)
+        assert merged == pytest.approx(0.0013)
+
+    def test_treats_non_numeric_response_cost_as_zero(self):
+        """Streaming paths pass ``response_cost`` as an empty string when
+        ``_hidden_params`` never populated a numeric cost; the merged value
+        should still be the guardrail spend and not raise a TypeError."""
+        request_data = {
+            "litellm_metadata": {
+                "standard_logging_guardrail_information": [
+                    {"guardrail_name": "g", "guardrail_status": "success", "guardrail_cost": 0.0003}
+                ]
+            }
+        }
+        merged = ProxyBaseLLMRequestProcessing._fold_guardrail_cost_into_response_cost("", request_data)
+        assert merged == pytest.approx(0.0003)
 
 
 class TestPreCallWithFallbacksOnLocalRateLimit:

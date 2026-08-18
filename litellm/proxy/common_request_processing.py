@@ -1230,6 +1230,9 @@ class ProxyBaseLLMRequestProcessing:
         cache_key: Final = hidden_params.get("cache_key", None) or ""
         api_base: Final = hidden_params.get("api_base", None) or ""
         response_cost: Final = hidden_params.get("response_cost", None) or ""
+        response_cost_with_guardrail: Final = ProxyBaseLLMRequestProcessing._fold_guardrail_cost_into_response_cost(
+            response_cost, request_data
+        )
         fastest_response_batch_completion: Final = hidden_params.get("fastest_response_batch_completion", None)
         additional_headers: Final = hidden_params.get("additional_headers", {}) or {}
 
@@ -1240,7 +1243,7 @@ class ProxyBaseLLMRequestProcessing:
             cache_key=cache_key,
             api_base=api_base,
             version=version,
-            response_cost=response_cost,
+            response_cost=response_cost_with_guardrail,
             model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
             fastest_response_batch_completion=fastest_response_batch_completion,
             request_data=request_data,
@@ -1693,6 +1696,26 @@ class ProxyBaseLLMRequestProcessing:
         recomputed_cost: Final = logging_obj._response_cost_calculator(result=response)
         return recomputed_cost if isinstance(recomputed_cost, (int, float)) else ""
 
+    @staticmethod
+    def _fold_guardrail_cost_into_response_cost(
+        response_cost: float | str,
+        request_data: dict,
+    ) -> float | str:
+        """
+        Add any pre-call guardrail spend (e.g. Bedrock ApplyGuardrail units) into the
+        cost surfaced to clients via ``x-litellm-response-cost`` so streaming, alternate
+        header builders and cache-hit paths report the fully billed amount instead of
+        the LLM-only figure that ``_hidden_params`` stores.
+        """
+        _, request_metadata_bucket = get_or_create_metadata_bucket(request_data)
+        guardrail_cost: Final = guardrail_information_cost(
+            request_metadata_bucket.get("standard_logging_guardrail_information")
+        )
+        if guardrail_cost <= 0:
+            return response_cost
+        llm_cost: Final = response_cost if isinstance(response_cost, (int, float)) else 0.0
+        return llm_cost + guardrail_cost
+
     def _debug_log_request_payload(self) -> None:
         """Log request payload at DEBUG level, truncating if too large."""
         if not verbose_proxy_logger.isEnabledFor(logging.DEBUG):
@@ -1943,6 +1966,9 @@ class ProxyBaseLLMRequestProcessing:
             if self._is_streaming_request(
                 data=self.data, is_streaming_request=is_streaming_request
             ) or self._is_streaming_response(response):  # use generate_responses to stream responses
+                streaming_response_cost: Final = self._fold_guardrail_cost_into_response_cost(
+                    response_cost, self.data
+                )
                 custom_headers: Final = ProxyBaseLLMRequestProcessing.get_custom_headers(
                     user_api_key_dict=user_api_key_dict,
                     call_id=logging_obj.litellm_call_id,
@@ -1950,7 +1976,7 @@ class ProxyBaseLLMRequestProcessing:
                     cache_key=cache_key,
                     api_base=api_base,
                     version=version,
-                    response_cost=response_cost,
+                    response_cost=streaming_response_cost,
                     model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
                     fastest_response_batch_completion=fastest_response_batch_completion,
                     request_data=self.data,
@@ -2121,6 +2147,9 @@ class ProxyBaseLLMRequestProcessing:
                 logging_obj._on_deferred_stream_complete = None
 
             if route_type == "allm_passthrough_route":
+                _passthrough_response_cost: Final = self._fold_guardrail_cost_into_response_cost(
+                    response_cost, self.data
+                )
                 _non_streaming_custom_headers: Final = ProxyBaseLLMRequestProcessing.get_custom_headers(
                     user_api_key_dict=user_api_key_dict,
                     call_id=logging_obj.litellm_call_id,
@@ -2128,7 +2157,7 @@ class ProxyBaseLLMRequestProcessing:
                     cache_key=cache_key,
                     api_base=api_base,
                     version=version,
-                    response_cost=response_cost,
+                    response_cost=_passthrough_response_cost,
                     model_region=getattr(user_api_key_dict, "allowed_model_region", ""),
                     fastest_response_batch_completion=fastest_response_batch_completion,
                     request_data=self.data,
@@ -2204,15 +2233,8 @@ class ProxyBaseLLMRequestProcessing:
             if recover_response_cost
             else response_cost
         )
-        _, request_metadata_bucket = get_or_create_metadata_bucket(self.data)
-        guardrail_cost_for_headers: Final = guardrail_information_cost(
-            request_metadata_bucket.get("standard_logging_guardrail_information")
-        )
-        response_cost_for_headers: Final = (
-            (llm_cost_for_headers if isinstance(llm_cost_for_headers, (int, float)) else 0.0)
-            + guardrail_cost_for_headers
-            if guardrail_cost_for_headers > 0
-            else llm_cost_for_headers
+        response_cost_for_headers: Final = self._fold_guardrail_cost_into_response_cost(
+            llm_cost_for_headers, self.data
         )
 
         fastapi_response.headers.update(
