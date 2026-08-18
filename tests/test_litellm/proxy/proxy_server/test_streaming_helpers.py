@@ -15,10 +15,15 @@ Pins covered:
 
 from __future__ import annotations
 
+import asyncio
 import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import Response
+from fastapi.responses import StreamingResponse
 
+import litellm
 from litellm.constants import RETURN_RAW_MODEL_NAME_METADATA_KEY
 import litellm.proxy.proxy_server as ps
 from litellm.proxy._types import UserAPIKeyAuth
@@ -1702,3 +1707,79 @@ async def test_async_data_generator_resolves_deployment_once_per_steady_stream(m
     assert router.get_deployment.call_count == 1
     assert router.get_model_list.call_count == 1
     assert out[-1] == "data: [DONE]\n\n"
+
+
+# ---------------------------------------------------------------------------
+# run_thread: SSE keepalives during the time-to-first-token
+# ---------------------------------------------------------------------------
+
+
+class _SlowAssistantsStream(_FakeAssistantsStream):
+    """The assistants run only contacts the upstream when the stream is entered,
+    and `create_response` buffers that first chunk, so the whole
+    time-to-first-token is spent before a byte can be written."""
+
+    def __init__(self, chunks, delay):
+        super().__init__(chunks)
+        self._delay = delay
+
+    async def __aenter__(self):
+        await asyncio.sleep(self._delay)
+        return self
+
+
+async def _run_thread_streaming(monkeypatch, interval, delay=0.3):
+    monkeypatch.setattr(litellm, "sse_keepalive_ping_interval_seconds", interval)
+
+    router = MagicMock()
+    router.get_model_list.return_value = []
+    router.arun_thread = AsyncMock(return_value=_SlowAssistantsStream([_simple_chunk(content="hi")], delay))
+    monkeypatch.setattr(ps, "llm_router", router)
+
+    async def _passthrough_hook(*, user_api_key_dict, response, data, **kwargs):
+        return response
+
+    monkeypatch.setattr(ps.proxy_logging_obj, "async_post_call_streaming_hook", _passthrough_hook)
+
+    async def _add_data(data, **kwargs):
+        return data
+
+    monkeypatch.setattr(ps, "add_litellm_data_to_request", _add_data)
+
+    request = MagicMock()
+    request.body = AsyncMock(return_value=b'{"assistant_id": "asst_1", "stream": true}')
+    request.is_disconnected = AsyncMock(return_value=False)
+
+    return await ps.run_thread(
+        request=request,
+        thread_id="thr_1",
+        fastapi_response=Response(),
+        user_api_key_dict=_user_auth(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_thread_pings_while_the_assistants_run_is_still_silent(monkeypatch):
+    """Regression for LIT-5737. A streaming assistants run wrote zero bytes for the
+    whole time-to-first-token, so an idle-timeout hop drops a healthy connection."""
+    response = await _run_thread_streaming(monkeypatch, interval=0.05)
+
+    assert isinstance(response, StreamingResponse)
+    assert response.headers["x-accel-buffering"] == "no"
+    chunks = [chunk async for chunk in response.body_iterator]
+
+    assert chunks[0] == b": ping\n\n"
+    assert chunks.count(b": ping\n\n") >= 3
+    assert chunks[-1] == b"data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_run_thread_stream_is_untouched_while_keepalives_are_unconfigured(monkeypatch):
+    """Off until an operator sets an interval, so the default run is unchanged."""
+    response = await _run_thread_streaming(monkeypatch, interval=None, delay=0.15)
+
+    assert isinstance(response, StreamingResponse)
+    chunks = [chunk async for chunk in response.body_iterator]
+
+    assert not any(chunk.startswith(": ping") for chunk in chunks)
+    assert chunks[-1] == "data: [DONE]\n\n"
