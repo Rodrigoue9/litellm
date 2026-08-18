@@ -11,13 +11,15 @@ export type ComplexityTier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
 export interface KeywordTierRule {
   id: string;
   keywords: string[];
-  tier: ComplexityTier;
+  /** A built-in tier name, or with a custom tier set, one of the defined tier names. */
+  tier: string;
 }
 
 interface KeywordTierRulesProps {
   rules: KeywordTierRule[];
   onChange: (rules: KeywordTierRule[]) => void;
   tierLabels?: Partial<Record<ComplexityTier, string>>;
+  tierNames?: string[];
 }
 
 const DEFAULT_TIER_LABELS: Record<ComplexityTier, string> = {
@@ -29,15 +31,24 @@ const DEFAULT_TIER_LABELS: Record<ComplexityTier, string> = {
 
 const TIER_ORDER: ComplexityTier[] = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
 
+const isBuiltInTier = (tier: string): tier is ComplexityTier => (TIER_ORDER as string[]).includes(tier);
+
 export const tierOptions = (
   tierLabels: Partial<Record<ComplexityTier, string>> | undefined,
-): { value: ComplexityTier; label: string }[] =>
-  TIER_ORDER.map((tier) => ({ value: tier, label: tierLabels?.[tier]?.trim() || DEFAULT_TIER_LABELS[tier] }));
+  tierNames?: string[],
+): { value: string; label: string }[] =>
+  (tierNames ?? TIER_ORDER).map((tier) => ({
+    value: tier,
+    label: (isBuiltInTier(tier) && (tierLabels?.[tier]?.trim() || DEFAULT_TIER_LABELS[tier])) || tier,
+  }));
+
+export const defaultRuleTier = (tierNames?: string[]): string =>
+  !tierNames || tierNames.includes("COMPLEX") ? "COMPLEX" : tierNames[0] ?? "COMPLEX";
 
 // A row exists only because the caller asked for it, so it reports its own gap straight away
 // rather than waiting for a submit; the submit button is disabled while one is outstanding, so
 // there is no failed attempt left to surface it.
-const KeywordTierRules: React.FC<KeywordTierRulesProps> = ({ rules, onChange, tierLabels }) => {
+const KeywordTierRules: React.FC<KeywordTierRulesProps> = ({ rules, onChange, tierLabels, tierNames }) => {
   const emptyRuleIndexes = new Set(emptyKeywordTierRuleIndexes(rules));
   const [drafts, setDrafts] = React.useState<Record<string, string>>({});
 
@@ -65,7 +76,7 @@ const KeywordTierRules: React.FC<KeywordTierRulesProps> = ({ rules, onChange, ti
   };
 
   const addRule = () => {
-    onChange([...rules, { id: `${Date.now()}`, keywords: [], tier: "COMPLEX" }]);
+    onChange([...rules, { id: `${Date.now()}`, keywords: [], tier: defaultRuleTier(tierNames) }]);
   };
 
   const updateRule = (id: string, updates: Partial<Omit<KeywordTierRule, "id">>) => {
@@ -137,8 +148,8 @@ const KeywordTierRules: React.FC<KeywordTierRulesProps> = ({ rules, onChange, ti
                   </Text>
                   <AntdSelect
                     value={rule.tier}
-                    onChange={(tier: ComplexityTier) => updateRule(rule.id, { tier })}
-                    options={tierOptions(tierLabels)}
+                    onChange={(tier: string) => updateRule(rule.id, { tier })}
+                    options={tierOptions(tierLabels, tierNames)}
                     style={{ width: "100%" }}
                   />
                 </div>

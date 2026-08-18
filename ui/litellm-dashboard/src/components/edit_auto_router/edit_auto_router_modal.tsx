@@ -4,12 +4,21 @@ import { TextInput } from "@tremor/react";
 import { modelAvailableCall, modelPatchUpdateCall } from "../networking";
 import { fetchAvailableModels, ModelGroup } from "@/components/llm_calls/fetch_models";
 import RouterConfigBuilder from "../add_model/RouterConfigBuilder";
-import { normalizeTierModels, resolveComplexityDefaultModel } from "../add_model/complexity_router_tiers";
+import {
+  customTierDefaultModel,
+  normalizeTierModels,
+  resolveComplexityDefaultModel,
+} from "../add_model/complexity_router_tiers";
 import { isComplexityRouter } from "../add_model/auto_router_strategies";
 import {
+  getCustomTierSetError,
+  getKeywordRuleTierError,
   getKeywordTierRulesError,
   getSemanticConfigError,
   getTierLabelsError,
+  customTierSetWireFields,
+  KEYS_REJECTED_WITH_CUSTOM_TIERS,
+  hydrateCustomTierSet,
   hydrateTierLabels,
   normalizeClassifierLlmConfig,
   serializeTierLabels,
@@ -25,10 +34,12 @@ import {
 import ComplexityRouterConfig, {
   ComplexityRouterConfigValue,
   ComplexityTiers,
+  CustomTierSet,
   DEFAULT_ADAPTIVE_WEIGHTS,
   DEFAULT_SESSION_AFFINITY,
   DEFAULT_DEPLOYMENT_AFFINITY,
   DEFAULT_TIER_DISTANCE_PENALTY,
+  effectiveClassifierType,
   heuristicScoringRole,
 } from "../add_model/ComplexityRouterConfig";
 import NotificationsManager from "../molecules/notifications_manager";
@@ -55,6 +66,8 @@ interface EditAutoRouterModalProps {
 // actually renders a control that can set it.
 const MANAGED_COMPLEXITY_ROUTER_KEYS = new Set([
   "tiers",
+  "tier_definitions",
+  "fallback_tier",
   "default_model",
   "tier_labels",
   "classifier_type",
@@ -101,11 +114,12 @@ export const hydratePinnedDefaultModel = (
   storedConfigDefaultModel: unknown,
   litellmParamsDefaultModel: string | null | undefined,
   tiers: ComplexityTiers,
+  customTierSet?: CustomTierSet,
 ): string | undefined => {
   if (typeof storedConfigDefaultModel === "string" && storedConfigDefaultModel.trim()) {
     return storedConfigDefaultModel;
   }
-  const tierDerived = resolveComplexityDefaultModel(tiers);
+  const tierDerived = customTierSet ? customTierDefaultModel(customTierSet) : resolveComplexityDefaultModel(tiers);
   const externalOverride = litellmParamsDefaultModel?.trim();
   return externalOverride && externalOverride !== tierDerived ? externalOverride : undefined;
 };
@@ -130,11 +144,51 @@ export const buildUpdatedComplexityRouterConfig = (
     return customTechnicalKeywords !== undefined && key === "custom_technical_keywords";
   };
 
-  const preservedConfig = Object.fromEntries(Object.entries(toRecord(storedConfig)).filter(([key]) => !isManaged(key)));
+  // Beyond the managed keys, the preserved set is trimmed per mode: a custom tier save drops
+  // stored keys the backend rejects beside tier_definitions, and a built-in save drops a stored
+  // classification_prompt, which requires tier_definitions and would orphan-400 after a restore.
+  const preservedConfig = Object.fromEntries(
+    Object.entries(toRecord(storedConfig))
+      .filter(([key]) => !isManaged(key))
+      .filter(([key]) =>
+        value.custom_tier_set ? !KEYS_REJECTED_WITH_CUSTOM_TIERS.includes(key) : key !== "classification_prompt",
+      ),
+  );
   const adaptiveEligible = value.adaptive_eligible ?? "all";
   const storedKeywordRules = keywordMatching ? serializeKeywordTierRules(keywordMatching.keywordTierRules) : [];
   const serializedTierLabels = serializeTierLabels(value.tier_labels);
   const scorerRuns = heuristicScoringRole(value) !== "never";
+
+  if (value.custom_tier_set) {
+    return {
+      ...preservedConfig,
+      ...(value.default_model?.trim() && { default_model: value.default_model }),
+      ...(value.classifier_context_window_size !== undefined && {
+        classifier_context_window_size: value.classifier_context_window_size,
+      }),
+      ...(value.classifier_context_per_turn_chars !== undefined && {
+        classifier_context_per_turn_chars: value.classifier_context_per_turn_chars,
+      }),
+      ...(value.classifier_context_include_assistant_turns !== undefined && {
+        classifier_context_include_assistant_turns: value.classifier_context_include_assistant_turns,
+      }),
+      deployment_affinity: value.deployment_affinity ?? DEFAULT_DEPLOYMENT_AFFINITY,
+      ...(customTechnicalKeywords &&
+        customTechnicalKeywords.length > 0 && {
+          custom_technical_keywords: customTechnicalKeywords,
+        }),
+      ...(value.return_raw_model_name && { return_raw_model_name: true }),
+      ...(keywordMatching && {
+        ...(storedKeywordRules.length > 0 && { keyword_tier_rules: storedKeywordRules }),
+        ...(keywordMatching.semanticMatchingEnabled && {
+          semantic_keyword_matching: true,
+          embedding_model: keywordMatching.embeddingModel,
+          match_threshold: keywordMatching.matchThreshold,
+        }),
+      }),
+      ...customTierSetWireFields(value.custom_tier_set, value.classifier_llm_config),
+    };
+  }
 
   return {
     ...preservedConfig,
@@ -222,11 +276,13 @@ const EditAutoRouterModal: React.FC<EditAutoRouterModalProps> = ({
   // is legal today stays legal.
   const submitBlockedReason = !isComplexityRouterModel
     ? null
-    : (Object.values(complexityRouterConfig.tiers).every((models) => models.length === 0)
-        ? "Please select at least one model for a complexity tier"
-        : null) ??
-      getTierLabelsError(complexityRouterConfig.tier_labels) ??
-      getKeywordTierRulesError(keywordTierRules);
+    : (complexityRouterConfig.custom_tier_set
+        ? getCustomTierSetError(complexityRouterConfig.custom_tier_set)
+        : (Object.values(complexityRouterConfig.tiers).every((models) => models.length === 0)
+            ? "Please select at least one model for a complexity tier"
+            : null) ?? getTierLabelsError(complexityRouterConfig.tier_labels)) ??
+      getKeywordTierRulesError(keywordTierRules) ??
+      getKeywordRuleTierError(keywordTierRules, complexityRouterConfig.custom_tier_set);
 
   useEffect(() => {
     if (isVisible && modelData) {
@@ -276,13 +332,16 @@ const EditAutoRouterModal: React.FC<EditAutoRouterModalProps> = ({
           COMPLEX: normalizeTierModels(parsedConfig.tiers?.COMPLEX),
           REASONING: normalizeTierModels(parsedConfig.tiers?.REASONING),
         };
+        const hydratedCustomTierSet = hydrateCustomTierSet(parsedConfig);
 
         const hydratedComplexityRouterConfig: ComplexityRouterConfigValue = {
           tiers: hydratedTiers,
+          custom_tier_set: hydratedCustomTierSet,
           default_model: hydratePinnedDefaultModel(
             parsedConfig.default_model,
             modelData.litellm_params?.complexity_router_default_model,
             hydratedTiers,
+            hydratedCustomTierSet,
           ),
           tier_labels: hydrateTierLabels(parsedConfig.tier_labels),
           classifier_type: parsedConfig.classifier_type || "heuristic",
@@ -378,12 +437,20 @@ const EditAutoRouterModal: React.FC<EditAutoRouterModalProps> = ({
 
       if (isComplexityRouterModel) {
         const { tiers, classifier_type, classifier_llm_config } = complexityRouterConfig;
-        if (Object.values(tiers).every((models) => models.length === 0)) {
+        const customTierSet = complexityRouterConfig.custom_tier_set;
+        if (customTierSet) {
+          const customTierSetError = getCustomTierSetError(customTierSet);
+          if (customTierSetError) {
+            setShowValidationErrors(true);
+            NotificationsManager.fromBackend(customTierSetError);
+            return;
+          }
+        } else if (Object.values(tiers).every((models) => models.length === 0)) {
           setShowValidationErrors(true);
           NotificationsManager.fromBackend("Please select at least one model for a complexity tier");
           return;
         }
-        if (classifier_type === "llm" && !classifier_llm_config?.model) {
+        if (effectiveClassifierType(complexityRouterConfig) === "llm" && !classifier_llm_config?.model) {
           setShowValidationErrors(true);
           NotificationsManager.fromBackend("Please select a classifier model, or switch back to Heuristic");
           return;
@@ -392,7 +459,9 @@ const EditAutoRouterModal: React.FC<EditAutoRouterModalProps> = ({
         // keyword rule with no keyword, and semantic_keyword_matching without an embedding model
         // or keyword rules (complexity_router/config.py), so without these a save fails as a raw
         // 400 instead of an inline message.
-        const keywordRulesError = getKeywordTierRulesError(keywordTierRules);
+        const keywordRulesError =
+          getKeywordTierRulesError(keywordTierRules) ??
+          getKeywordRuleTierError(keywordTierRules, complexityRouterConfig.custom_tier_set);
         if (keywordRulesError) {
           setShowValidationErrors(true);
           NotificationsManager.fromBackend(keywordRulesError);
@@ -411,7 +480,9 @@ const EditAutoRouterModal: React.FC<EditAutoRouterModalProps> = ({
         // build_complexity_router_config.ts for why create never can). init_complexity_router_deployment
         // raises in that case (litellm/router.py), so block it rather than saving a router that
         // fails at init.
-        const defaultModel = resolveComplexityDefaultModel(tiers, complexityRouterConfig.default_model);
+        const defaultModel = customTierSet
+          ? customTierDefaultModel(customTierSet, complexityRouterConfig.default_model)
+          : resolveComplexityDefaultModel(tiers, complexityRouterConfig.default_model);
         if (!defaultModel) {
           setShowValidationErrors(true);
           NotificationsManager.fromBackend(

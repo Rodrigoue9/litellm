@@ -13,6 +13,8 @@ import { autoRouterListKey, fetchAllModelDeployments } from "@/app/(dashboard)/h
 import ComplexityRouterConfig, {
   ComplexityRouterConfigValue,
   ComplexityTiers,
+  CustomTierSet,
+  effectiveClassifierType,
   DEFAULT_ADAPTIVE_WEIGHTS,
   DEFAULT_SESSION_AFFINITY,
   DEFAULT_DEPLOYMENT_AFFINITY,
@@ -24,12 +26,14 @@ import { DEFAULT_MATCH_THRESHOLD } from "./SemanticKeywordMatching";
 import {
   BuildComplexityRouterConfigParams,
   buildComplexityRouterConfig,
+  getCustomTierSetError,
+  getKeywordRuleTierError,
   getKeywordTierRulesError,
   getMissingTiersError,
   getSemanticConfigError,
   getTierLabelsError,
 } from "./build_complexity_router_config";
-import { resolveComplexityDefaultModel } from "./complexity_router_tiers";
+import { customTierDefaultModel, resolveComplexityDefaultModel } from "./complexity_router_tiers";
 import { buildAutoRouterTestTargets, AutoRouterTestTarget } from "./build_auto_router_test_targets";
 import AutoRouterConnectionTest from "./auto_router_connection_test";
 import AutoRouterRoutingTest from "./AutoRouterRoutingTest";
@@ -92,15 +96,17 @@ const presets = getAllPresets();
 
 // A one-line summary of what's configured, shown when the detailed section is collapsed so a
 // caller can see the shape of the config without opening it.
-const tierConfigSummary = (tiers: ComplexityTiers): string => {
-  const parts = (
-    [
-      ["Simple", tiers.SIMPLE],
-      ["Medium", tiers.MEDIUM],
-      ["Complex", tiers.COMPLEX],
-      ["Reasoning", tiers.REASONING],
-    ] as const
-  )
+const tierConfigSummary = (tiers: ComplexityTiers, customTierSet?: CustomTierSet): string => {
+  const builtInRows: [string, string[]][] = [
+    ["Simple", tiers.SIMPLE],
+    ["Medium", tiers.MEDIUM],
+    ["Complex", tiers.COMPLEX],
+    ["Reasoning", tiers.REASONING],
+  ];
+  const rows: [string, string[]][] = customTierSet
+    ? customTierSet.tiers.map((row): [string, string[]] => [row.name.trim() || "New tier", row.models])
+    : builtInRows;
+  const parts = rows
     .filter(([, models]) => models.length > 0)
     .map(([label, models]) => `${label}: ${models.join(", ")}`);
   return parts.length > 0 ? parts.join(" · ") : "No tiers configured yet";
@@ -116,9 +122,11 @@ const getSubmitBlockedReason = (
   referencedModelsParams: Parameters<typeof getReferencedModelsError>[0],
   availability: ModelAvailability,
 ): string | null =>
-  getMissingTiersError(config.tiers) ??
-  getTierLabelsError(config.tier_labels) ??
+  (config.custom_tier_set
+    ? getCustomTierSetError(config.custom_tier_set)
+    : getMissingTiersError(config.tiers) ?? getTierLabelsError(config.tier_labels)) ??
   getKeywordTierRulesError(keywordTierRules) ??
+  getKeywordRuleTierError(keywordTierRules, config.custom_tier_set) ??
   getReferencedModelsError(referencedModelsParams, availability);
 
 const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({
@@ -264,9 +272,13 @@ const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({
     setDetailsExpanded(presetState.viaDeployments);
   };
 
+  const customTierSet = complexityRouterConfig.custom_tier_set;
+  const emptyTiers: ComplexityTiers = { SIMPLE: [], MEDIUM: [], COMPLEX: [], REASONING: [] };
+
   const referencedModelsParams = {
-    tiers: complexityRouterConfig.tiers,
-    classifierType: complexityRouterConfig.classifier_type,
+    tiers: customTierSet ? emptyTiers : complexityRouterConfig.tiers,
+    additionalModels: customTierSet?.tiers.flatMap((row) => row.models),
+    classifierType: effectiveClassifierType(complexityRouterConfig),
     classifierLlmConfig: complexityRouterConfig.classifier_llm_config,
     semanticMatchingEnabled,
     embeddingModel,
@@ -282,9 +294,10 @@ const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({
 
   const complexityRouterConfigParams: BuildComplexityRouterConfigParams = {
     tiers: complexityRouterConfig.tiers,
+    customTierSet,
     defaultModel: complexityRouterConfig.default_model,
     tierLabels: complexityRouterConfig.tier_labels,
-    classifierType: complexityRouterConfig.classifier_type,
+    classifierType: effectiveClassifierType(complexityRouterConfig),
     classifierLlmConfig: complexityRouterConfig.classifier_llm_config,
     classifierContextWindowSize: complexityRouterConfig.classifier_context_window_size,
     classifierContextPerTurnChars: complexityRouterConfig.classifier_context_per_turn_chars,
@@ -311,17 +324,12 @@ const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({
   const submitRecommendedRouter = (name: string) => {
     const { tiers, tierLabels, classifierType, classifierLlmConfig } = complexityRouterConfigParams;
 
-    const missingTiersError = getMissingTiersError(tiers);
-    if (missingTiersError) {
+    const tierSetupError = customTierSet
+      ? getCustomTierSetError(customTierSet)
+      : getMissingTiersError(tiers) ?? getTierLabelsError(tierLabels);
+    if (tierSetupError) {
       setShowValidationErrors(true);
-      NotificationManager.fromBackend(missingTiersError);
-      return;
-    }
-
-    const tierLabelsError = getTierLabelsError(tierLabels);
-    if (tierLabelsError) {
-      setShowValidationErrors(true);
-      NotificationManager.fromBackend(tierLabelsError);
+      NotificationManager.fromBackend(tierSetupError);
       return;
     }
 
@@ -331,7 +339,8 @@ const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({
       return;
     }
 
-    const keywordRulesError = getKeywordTierRulesError(keywordTierRules);
+    const keywordRulesError =
+      getKeywordTierRulesError(keywordTierRules) ?? getKeywordRuleTierError(keywordTierRules, customTierSet);
     if (keywordRulesError) {
       setShowValidationErrors(true);
       NotificationManager.fromBackend(keywordRulesError);
@@ -356,7 +365,9 @@ const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({
       return;
     }
 
-    const defaultModel = resolveComplexityDefaultModel(tiers, complexityRouterConfig.default_model);
+    const defaultModel = customTierSet
+      ? customTierDefaultModel(customTierSet, complexityRouterConfig.default_model)
+      : resolveComplexityDefaultModel(tiers, complexityRouterConfig.default_model);
 
     form.setFieldsValue({
       custom_llm_provider: "auto_router",
@@ -403,10 +414,13 @@ const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({
 
   const handleTestConnection = () => {
     const testTargetParams = {
-      tiers: complexityRouterConfig.tiers,
+      tiers: customTierSet ? emptyTiers : complexityRouterConfig.tiers,
+      additionalTiers: customTierSet?.tiers.map((row) => ({ name: row.name.trim(), models: row.models })),
       semanticMatchingEnabled,
       embeddingModel,
-      defaultModel: resolveComplexityDefaultModel(complexityRouterConfig.tiers, complexityRouterConfig.default_model),
+      defaultModel: customTierSet
+        ? customTierDefaultModel(customTierSet, complexityRouterConfig.default_model)
+        : resolveComplexityDefaultModel(complexityRouterConfig.tiers, complexityRouterConfig.default_model),
     };
     const targets = buildAutoRouterTestTargets(testTargetParams);
 
@@ -523,7 +537,7 @@ const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({
               </span>
               {!detailsExpanded && (
                 <span className="text-xs text-gray-500 line-clamp-2">
-                  {tierConfigSummary(complexityRouterConfig.tiers)}
+                  {tierConfigSummary(complexityRouterConfig.tiers, customTierSet)}
                 </span>
               )}
             </button>
@@ -630,10 +644,11 @@ const AddAutoRouterTab: React.FC<AddAutoRouterTabProps> = ({
           <AutoRouterRoutingTest
             accessToken={accessToken}
             config={buildComplexityRouterConfig(complexityRouterConfigParams)}
-            defaultModel={resolveComplexityDefaultModel(
-              complexityRouterConfig.tiers,
-              complexityRouterConfig.default_model,
-            )}
+            defaultModel={
+              customTierSet
+                ? customTierDefaultModel(customTierSet, complexityRouterConfig.default_model)
+                : resolveComplexityDefaultModel(complexityRouterConfig.tiers, complexityRouterConfig.default_model)
+            }
             routerName={form.getFieldValue("auto_router_name")}
             teamId={requiresTeamScope ? form.getFieldValue("team_id") : undefined}
           />
