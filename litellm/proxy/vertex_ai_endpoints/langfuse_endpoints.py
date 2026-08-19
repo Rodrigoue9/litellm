@@ -146,6 +146,41 @@ def _build_langfuse_proxy_target(
     return str(updated_url), custom_headers
 
 
+def _extract_langfuse_api_key(request: Request) -> str:
+    auth_header = request.headers.get("Authorization") or ""
+    if not auth_header.startswith("Basic "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "Malformed or missing Basic authorization header for Langfuse pass-through"},
+        )
+
+    basic_token = auth_header[6:].strip()
+    try:
+        decoded_bytes: Final = base64.b64decode(basic_token)
+        decoded_str: Final = decoded_bytes.decode("utf-8")
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "Invalid base64 encoding in Basic authorization header"},
+        )
+
+    if ":" not in decoded_str:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "Malformed Basic credentials, expected public_key:secret_key"},
+        )
+
+    parts = decoded_str.split(":", 1)
+    secret_key = parts[1]
+    if not secret_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "Empty secret key in Basic authorization header"},
+        )
+
+    return secret_key
+
+
 @router.api_route(
     "/langfuse/{endpoint:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -163,16 +198,7 @@ async def langfuse_proxy_route(
     """
     from litellm.proxy.proxy_server import proxy_config
 
-    ## CHECK FOR LITELLM API KEY IN THE QUERY PARAMS - ?..key=LITELLM_API_KEY
-    api_key = request.headers.get("Authorization") or ""
-
-    ## decrypt base64 hash
-    api_key = api_key.replace("Basic ", "")
-
-    decoded_bytes: Final = base64.b64decode(api_key)
-    decoded_str: Final = decoded_bytes.decode("utf-8")
-    api_key = decoded_str.split(":")[1]  # assume api key is passed in as secret key
-
+    api_key = _extract_langfuse_api_key(request)
     user_api_key_dict: Final = await user_api_key_auth(request=request, api_key=f"Bearer {api_key}")
 
     callback_settings_obj: Final[TeamCallbackMetadata | None] = _get_dynamic_logging_metadata(

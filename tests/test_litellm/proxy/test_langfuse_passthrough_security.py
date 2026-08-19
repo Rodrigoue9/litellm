@@ -100,3 +100,43 @@ def test_dynamic_langfuse_proxy_target_preserves_host_header_for_http(monkeypatc
 
     assert target_url == "http://8.8.8.8/api/public/projects"
     assert headers["Host"] == "langfuse.example"
+
+
+def test_extract_langfuse_api_key_valid():
+    from base64 import b64encode
+    from unittest.mock import MagicMock
+    from litellm.proxy.vertex_ai_endpoints.langfuse_endpoints import _extract_langfuse_api_key
+
+    raw = "pk_test_123:sk_test_456"
+    encoded = b64encode(raw.encode("utf-8")).decode("utf-8")
+
+    req = MagicMock()
+    req.headers = {"Authorization": f"Basic {encoded}"}
+
+    key = _extract_langfuse_api_key(req)
+    assert key == "sk_test_456"
+
+
+@pytest.mark.parametrize(
+    "auth_header",
+    [
+        None,
+        "",
+        "Bearer some_token",
+        "Basic ???invalid_base64???",
+        f"Basic {b64encode(b'no_colon').decode('utf-8')}",
+        f"Basic {b64encode(b'public_key:').decode('utf-8')}",
+    ],
+)
+def test_extract_langfuse_api_key_invalid(auth_header):
+    from unittest.mock import MagicMock
+    from litellm.proxy.vertex_ai_endpoints.langfuse_endpoints import _extract_langfuse_api_key
+
+    req = MagicMock()
+    req.headers = {"Authorization": auth_header} if auth_header is not None else {}
+
+    with pytest.raises(HTTPException) as exc:
+        _extract_langfuse_api_key(req)
+
+    assert exc.value.status_code == 401
+
