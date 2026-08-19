@@ -697,16 +697,27 @@ class ChunkProcessor:
             cache_read_input_tokens = usage_chunk.get("cache_read_input_tokens")
         if "cost" in usage_chunk:
             cost = usage_chunk.get("cost")
-        if hasattr(usage_chunk, "completion_tokens_details"):
-            if isinstance(usage_chunk.completion_tokens_details, dict):
-                completion_tokens_details = CompletionTokensDetails(**usage_chunk.completion_tokens_details)
-            elif isinstance(usage_chunk.completion_tokens_details, CompletionTokensDetails):
-                completion_tokens_details = usage_chunk.completion_tokens_details
-        if hasattr(usage_chunk, "prompt_tokens_details"):
-            if isinstance(usage_chunk.prompt_tokens_details, dict):
-                prompt_tokens_details = PromptTokensDetailsWrapper(**usage_chunk.prompt_tokens_details)
-            elif isinstance(usage_chunk.prompt_tokens_details, PromptTokensDetailsWrapper):
-                prompt_tokens_details = usage_chunk.prompt_tokens_details
+        raw_completion_details = (
+            usage_chunk.get("completion_tokens_details")
+            if isinstance(usage_chunk, dict)
+            else getattr(usage_chunk, "completion_tokens_details", None)
+        )
+        if raw_completion_details is not None:
+            if isinstance(raw_completion_details, dict):
+                completion_tokens_details = CompletionTokensDetails(**raw_completion_details)
+            elif isinstance(raw_completion_details, CompletionTokensDetails):
+                completion_tokens_details = raw_completion_details
+
+        raw_prompt_details = (
+            usage_chunk.get("prompt_tokens_details")
+            if isinstance(usage_chunk, dict)
+            else getattr(usage_chunk, "prompt_tokens_details", None)
+        )
+        if raw_prompt_details is not None:
+            if isinstance(raw_prompt_details, dict):
+                prompt_tokens_details = PromptTokensDetailsWrapper(**raw_prompt_details)
+            elif isinstance(raw_prompt_details, PromptTokensDetailsWrapper):
+                prompt_tokens_details = raw_prompt_details
 
         return {
             "prompt_tokens": prompt_tokens,
