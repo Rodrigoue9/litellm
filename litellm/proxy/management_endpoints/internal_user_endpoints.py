@@ -2018,6 +2018,7 @@ async def get_users(
     user_ids: str | None = fastapi.Query(default=None, description="Get list of users by user_ids"),
     sso_user_ids: str | None = fastapi.Query(default=None, description="Get list of users by sso_user_id"),
     user_email: str | None = fastapi.Query(default=None, description="Filter users by partial email match"),
+    user_alias: str | None = fastapi.Query(default=None, description="Filter users by partial alias match"),
     team: str | None = fastapi.Query(default=None, description="Filter users by team id"),
     page: int = fastapi.Query(default=1, ge=1, description="Page number"),
     page_size: int = fastapi.Query(default=25, ge=1, le=100, description="Number of items per page"),
@@ -2104,6 +2105,12 @@ async def get_users(
     if user_email is not None and isinstance(user_email, str):
         where_conditions["user_email"] = {
             "contains": user_email,
+            "mode": "insensitive",  # Case-insensitive search
+        }
+
+    if user_alias is not None and isinstance(user_alias, str):
+        where_conditions["user_alias"] = {
+            "contains": user_alias,
             "mode": "insensitive",  # Case-insensitive search
         }
 
