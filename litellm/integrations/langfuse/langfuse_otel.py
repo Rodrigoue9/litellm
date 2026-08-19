@@ -197,7 +197,14 @@ class LangfuseOtelLogger(OpenTelemetry):
                         )
                     elif item_type == "function_call":
                         arguments_str = getattr(item, "arguments", "{}")
-                        arguments_obj = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
+                        try:
+                            arguments_obj = (
+                                json.loads(arguments_str)
+                                if isinstance(arguments_str, str)
+                                else arguments_str
+                            )
+                        except Exception:
+                            arguments_obj = arguments_str if isinstance(arguments_str, str) else {}
                         langfuse_tool_call = {
                             "id": getattr(item, "id", ""),
                             "name": getattr(item, "name", ""),
