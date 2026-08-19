@@ -164,14 +164,15 @@ class PromptManagementBase(ABC):
         ignore_prompt_manager_model: bool | None = False,
         ignore_prompt_manager_optional_params: bool | None = False,
     ) -> tuple[str, list[AllMessageValues], dict]:
-        if prompt_id is None:
-            raise ValueError("prompt_id is required for Prompt Management Base class")
         if not self.should_run_prompt_management(
             prompt_id=prompt_id,
             prompt_spec=prompt_spec,
             dynamic_callback_params=dynamic_callback_params,
         ):
             return model, messages, non_default_params
+
+        if prompt_id is None:
+            raise ValueError("prompt_id is required for Prompt Management Base class")
 
         prompt_template: Final = self.compile_prompt(
             prompt_id=prompt_id,
