@@ -152,14 +152,26 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
 
         input = self._validate_input_param(input)
         tools = response_api_optional_request_params.get("tools")
-        input, tools = self.remove_cache_control_flag_from_input_and_tools(model=model, input=input, tools=tools)
-        if tools is not None:
-            response_api_optional_request_params["tools"] = tools
+        if not self._should_preserve_cache_control_for_endpoint(
+            getattr(litellm_params, "custom_llm_provider", None), getattr(litellm_params, "api_base", None)
+        ):
+            input, tools = self.remove_cache_control_flag_from_input_and_tools(model=model, input=input, tools=tools)
+            if tools is not None:
+                response_api_optional_request_params["tools"] = tools
         final_request_params: Final = dict(
             ResponsesAPIRequestParams(model=model, input=input, **response_api_optional_request_params)
         )
 
         return final_request_params
+
+    def _should_preserve_cache_control_for_endpoint(
+        self,
+        custom_llm_provider: str | None,
+        api_base: str | None,
+    ) -> bool:
+        if custom_llm_provider == "openai" and api_base and not ("api.openai.com" in api_base):
+            return True
+        return False
 
     def remove_cache_control_flag_from_input_and_tools(
         self,
